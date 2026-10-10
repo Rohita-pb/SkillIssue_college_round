@@ -7,14 +7,15 @@
     "dev": "concurrently -k -n api,web -c cyan,green \"tsx watch server/index.ts\" \"vite --host 0.0.0.0\"",
     "build": "tsc --noEmit && vite build",
     "start": "tsx server/index.ts",
-    "test": "tsx --test server/engine.test.ts",
+    "test": "tsx --test server/engine.test.ts server/platform.test.ts",
     "test:e2e": "playwright test"
   },
   "dependencies": {
     "express": "^4.21.2",
     "lucide-react": "^0.468.0",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react-dom": "^19.0.0",
+    "zod": "^4.6.5"
   },
   "devDependencies": {
     "@playwright/test": "^1.64.0",

@@ -2,6 +2,8 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import { resolve } from 'node:path';
 import { builtInTargets, id, runSimulation, selectAttack } from './engine.js';
 import { SURFACES, type Campaign, type Store } from '../shared/types.js';
+import { demoOverview, seedPlatform } from './platform/index.js';
+import { fingerprintTwin } from './platform/twins.js';
 
 const directory = resolve(process.env.AGENTBREAK_DATA_DIR || '.agentbreak');
 const file = resolve(directory, 'store.json');
@@ -31,6 +33,13 @@ function seedStore(): Store {
 export function loadStore(): Store {
   mkdirSync(directory, { recursive: true });
   const store: Store = existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : seedStore();
+  if (!store.platform || store.platform.version !== 2) store.platform = seedPlatform();
+  const researchIdentity = store.platform.twins[0]?.agents.find(agent => agent.id === 'research');
+  if (researchIdentity && !researchIdentity.intendedTools.includes('export_data')) { researchIdentity.intendedTools.push('export_data'); store.platform.twins[0].fingerprint = fingerprintTwin(store.platform.twins[0]); }
+  const currentFingerprints = new Set(store.platform.twins.map(twin => twin.fingerprint));
+  store.platform.repairs = store.platform.repairs.filter(repair => currentFingerprints.has(repair.twinFingerprint));
+  store.platform.gates = store.platform.gates.filter(gate => currentFingerprints.has(gate.twinFingerprint));
+  if (!store.platform.runs.length) demoOverview(store.platform);
   for (const campaign of store.campaigns) {
     if (campaign.status === 'running') { campaign.status = 'stopped'; campaign.finishedAt = new Date().toISOString(); }
   }

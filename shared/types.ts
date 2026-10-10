@@ -95,6 +95,7 @@ export interface Store {
   campaigns: Campaign[];
   traces: Trace[];
   validations: Validation[];
+  platform?: import('./platform.js').PlatformState;
 }
 
 export const SURFACES: { id: Surface; label: string; short: string; description: string }[] = [

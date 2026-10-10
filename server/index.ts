@@ -4,6 +4,10 @@ import { resolve } from 'node:path';
 import { SURFACES, type AttackInput, type Campaign, type Defense, type Surface, type Target, type ToolName } from '../shared/types.js';
 import { id, runAttack, selectAttack, validateDefenses } from './engine.js';
 import { loadStore, saveStore } from './store.js';
+import { advanceExperiment, analyzeRun, applyRepair, approveRuntime, createSession, findRepair, getTwin, importTwin, patchTwin, replayRun, runGate, runRuntimeOperation, startExperiment, stopExperiment, viewPlatform } from './platform/index.js';
+import { auditPermissions } from './platform/twins.js';
+import { appendAudit, verifyAudit } from './platform/audit.js';
+import { type Operation, type PlatformState, type ShieldPolicy } from '../shared/platform.js';
 
 const app = express();
 const store = loadStore();
@@ -15,7 +19,16 @@ app.use(express.json({ limit: '128kb' }));
 app.use('/api', (req, res, next) => {
   const origin = req.headers.origin;
   if (origin) {
-    try { if (new URL(origin).host !== req.headers.host) return res.status(403).json({ error: 'Cross-origin API access is disabled.' }); }
+    try {
+      const originUrl = new URL(origin);
+      const requestHostname = String(req.headers.host || '').split(':')[0].replace('[', '').replace(']', '');
+      const loopback = new Set(['localhost', '127.0.0.1', '::1']);
+      const sameOrigin = originUrl.host === req.headers.host;
+      // Vite’s local dev proxy keeps the browser on :5173 while forwarding
+      // requests to the API on :3001. Both endpoints remain loopback-only.
+      const localDevProxy = loopback.has(originUrl.hostname) && loopback.has(requestHostname);
+      if (!sameOrigin && !localDevProxy) return res.status(403).json({ error: 'Cross-origin API access is disabled.' });
+    }
     catch { return res.status(403).json({ error: 'Invalid origin.' }); }
   }
   next();
@@ -23,6 +36,26 @@ app.use('/api', (req, res, next) => {
 
 app.get('/api/state', (_req, res) => res.json(store));
 app.get('/api/health', (_req, res) => res.json({ status: 'ok', mode: 'sandbox', modelConnected: store.targets.some(t => t.mode === 'model') }));
+app.get('/api/platform', (_req, res) => res.json(store.platform ? viewPlatform(store.platform) : null));
+app.get('/api/platform/twins/:id/audit', (req, res) => { try { const twin = getTwin(requirePlatform(), req.params.id); res.json({ twin, findings: auditPermissions(twin) }); } catch (error) { res.status(404).json({ error: error instanceof Error ? error.message : 'Twin not found.' }); } });
+app.get('/api/platform/audit/verify', (_req, res) => res.json(store.platform ? verifyAudit(store.platform.audit) : { valid: false, checked: 0, head: 'GENESIS' }));
+app.get('/api/platform/report', (_req, res) => { if (!store.platform) return res.status(503).json({ error: 'Platform state is not initialized.' }); res.setHeader('Content-Disposition', 'attachment; filename="agentbreak-platform-evidence.json"'); res.json({ schemaVersion: 2, generatedAt: new Date().toISOString(), evidenceBoundary: 'Synthetic digital twin; in-memory effects; hash-linked audit chain.', platform: viewPlatform(store.platform) }); });
+
+function requirePlatform(): PlatformState { if (!store.platform) throw new Error('Platform state is not initialized.'); return store.platform; }
+function persistPlatform() { saveStore(store); }
+function requireOperator(req: express.Request, res: express.Response): boolean {
+  const expected = process.env.AGENTBREAK_OPERATOR_TOKEN;
+  if (!expected) return true;
+  if (req.headers.authorization !== `Bearer ${expected}`) { res.status(401).json({ error: 'Operator authentication required for this control-plane action.' }); return false; }
+  return true;
+}
+function parseOperation(input: unknown): Operation {
+  if (!input || typeof input !== 'object') throw new Error('A runtime operation object is required.');
+  const value = input as Partial<Operation>;
+  if (typeof value.id !== 'string' || typeof value.label !== 'string' || typeof value.tool !== 'string' || !Number.isInteger(value.turn) || !value.source || typeof value.source !== 'object' || !value.args || typeof value.args !== 'object' || Array.isArray(value.args)) throw new Error('Invalid runtime operation.');
+  return value as Operation;
+}
+function withPlatformErrors(handler: (req: express.Request, res: express.Response) => unknown) { return (req: express.Request, res: express.Response, next: express.NextFunction) => { try { const result = handler(req, res); if (result instanceof Promise) void result.catch(next); } catch (error) { const message = error instanceof Error ? error.message : 'Platform operation failed.'; res.status(message.includes('not found') ? 404 : 400).json({ error: message }); } }; }
 
 async function executeCampaign(campaign: Campaign) {
   running.add(campaign.id);
@@ -139,6 +172,22 @@ app.get('/api/report', (_req, res) => {
   res.setHeader('Content-Disposition', 'attachment; filename="agentbreak-security-report.json"');
   res.json({ generatedAt: new Date().toISOString(), environment: 'Isolated sandbox; built-in targets are policy-based simulations.', ...store });
 });
+
+// AgentBreak Platform v2: twin, gateway, attack graph, repair, gate, and audit APIs.
+app.post('/api/platform/twins', withPlatformErrors((req, res) => { if (!requireOperator(req, res)) return; const twin = importTwin(requirePlatform(), req.body); persistPlatform(); res.status(201).json(twin); }));
+app.post('/api/platform/twins/:id/version', withPlatformErrors((req, res) => { if (!requireOperator(req, res)) return; const body = req.body as { policy?: ShieldPolicy; shieldMode?: 'observe' | 'enforce'; allowedOrigins?: string[]; refundLimit?: number }; const twin = patchTwin(requirePlatform(), req.params.id, body); persistPlatform(); res.status(201).json(twin); }));
+app.post('/api/platform/sessions', withPlatformErrors((req, res) => { const session = createSession(requirePlatform(), req.body.twinId, req.body.actorId, req.body.tenantId); persistPlatform(); res.status(201).json(session); }));
+app.post('/api/platform/sessions/:id/events', withPlatformErrors((req, res) => { const event = runRuntimeOperation(requirePlatform(), req.params.id, parseOperation(req.body)); persistPlatform(); res.status(201).json(event); }));
+app.post('/api/platform/sessions/:id/approvals/:approvalId', withPlatformErrors((req, res) => { if (!requireOperator(req, res)) return; const result = approveRuntime(requirePlatform(), req.params.id, req.params.approvalId, req.body.approve === true, String(req.body.reviewer || 'operator'), String(req.body.reason || '')); persistPlatform(); res.json(result); }));
+app.post('/api/platform/experiments', withPlatformErrors((req, res) => { const requestedMode = req.body.mode === 'model' ? 'model' : 'fixture'; if (requestedMode === 'model' && (!process.env.AGENTBREAK_MODEL_BASE_URL || !process.env.AGENTBREAK_MODEL_NAME)) return res.status(400).json({ error: 'Model mode requires AGENTBREAK_MODEL_BASE_URL and AGENTBREAK_MODEL_NAME. Fixture mode remains fully reproducible.' }); const experiment = startExperiment(requirePlatform(), req.body.twinId, String(req.body.name || 'Autonomous attack discovery'), Math.min(50, Math.max(1, Number(req.body.budget || 12))), Math.max(0, Number(req.body.seed || 7331)), requestedMode); persistPlatform(); res.status(201).json(experiment); }));
+app.post('/api/platform/experiments/:id/step', withPlatformErrors(async (req, res) => { const result = await advanceExperiment(requirePlatform(), req.params.id); persistPlatform(); res.status(201).json(result); }));
+app.post('/api/platform/experiments/:id/stop', withPlatformErrors((req, res) => { const experiment = stopExperiment(requirePlatform(), req.params.id); persistPlatform(); res.json(experiment); }));
+app.post('/api/platform/runs/:id/replay', withPlatformErrors(async (req, res) => { const run = await replayRun(requirePlatform(), req.params.id); persistPlatform(); res.status(201).json(run); }));
+app.post('/api/platform/runs/:id/causal', withPlatformErrors((req, res) => { const analysis = analyzeRun(requirePlatform(), req.params.id); persistPlatform(); res.status(201).json(analysis); }));
+app.post('/api/platform/repairs/search', withPlatformErrors((req, res) => { const repair = findRepair(requirePlatform(), req.body.twinId); persistPlatform(); res.status(201).json(repair); }));
+app.post('/api/platform/repairs/:id/apply', withPlatformErrors((req, res) => { if (!requireOperator(req, res)) return; const twin = applyRepair(requirePlatform(), req.params.id); persistPlatform(); res.status(201).json(twin); }));
+app.post('/api/platform/gates', withPlatformErrors(async (req, res) => { if (!requireOperator(req, res)) return; const gate = await runGate(requirePlatform(), req.body.twinId); persistPlatform(); res.status(201).json(gate); }));
+app.get('/api/platform/evidence/:id', withPlatformErrors((req, res) => { const platform = requirePlatform(); const run = platform.runs.find(r => r.id === req.params.id); const analysis = platform.analyses.find(a => a.runId === req.params.id); const audit = platform.audit.filter(a => a.subjectId === req.params.id || (a.payload && typeof a.payload === 'object' && JSON.stringify(a.payload).includes(req.params.id))); if (!run) return res.status(404).json({ error: 'Evidence subject not found.' }); res.json({ run, analysis, audit, graph: { nodes: [{ id: 'source', label: 'Untrusted source', kind: 'source' }, ...run.scenario.operations.map(o => ({ id: o.id, label: o.label, kind: o.tool })), { id: 'outcome', label: run.verification.objectiveMet ? 'Unauthorized effect' : 'Prevented', kind: 'outcome' }], edges: run.scenario.operations.map((o, i) => ({ from: i === 0 ? 'source' : run.scenario.operations[i - 1].id, to: o.id })).concat(run.scenario.operations.length ? [{ from: run.scenario.operations.at(-1)!.id, to: 'outcome' }] : []) } }); }));
 
 app.use('/api', (_req, res) => res.status(404).json({ error: 'API endpoint not found.' }));
 const dist = resolve('dist');
