@@ -1,0 +1,110 @@
+import { test, expect } from '@playwright/test';
+import type { Store, Trace } from '../shared/types';
+
+test('dashboard, surface filters, trace replay, and portable reproduction work', async ({ page, request }, testInfo) => {
+  const errors: string[] = [];
+  page.on('pageerror', error => errors.push(error.message));
+  await page.goto('/');
+  await expect(page.getByRole('heading', { name: 'Security overview' })).toBeVisible();
+  await expect(page.locator('.stat-main').first()).toHaveText('180');
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await page.screenshot({ path: testInfo.outputPath('desktop.png'), fullPage: true });
+  await page.locator('.findings-table tbody tr').first().click();
+  const drawer = page.getByRole('dialog');
+  await expect(drawer.getByRole('button', { name: 'Execution timeline' })).toBeVisible();
+  await expect(drawer.getByText('Policy boundary crossed').first()).toBeVisible();
+  const replayRequest = page.waitForResponse(r => r.url().endsWith('/replay') && r.request().method() === 'POST');
+  await drawer.getByRole('button', { name: 'Replay attack' }).click();
+  const replay = await (await replayRequest).json() as Trace;
+  expect(replay.outcome).toBe('success');
+  expect(replay.replayOf).toBeTruthy();
+  await expect(drawer.getByText('Replayed', { exact: true })).toBeVisible();
+  const exported = await request.get(`/api/traces/${replay.id}/export`);
+  expect(exported.ok()).toBe(true);
+  const envelope = await exported.json();
+  const imported = await request.post('/api/traces/import', { data: envelope });
+  expect(imported.status()).toBe(201);
+  const reproduced = await imported.json() as Trace;
+  expect(reproduced.fingerprint).toBe(replay.fingerprint);
+  expect(reproduced.steps).toEqual(replay.steps);
+  await page.keyboard.press('Escape');
+  await page.locator('.surface-row').filter({ hasText: 'Memory poisoning' }).click();
+  await expect(page.getByLabel('Attack surface')).toHaveValue('memory');
+  await expect(page.locator('.trace-table tbody tr').first()).toContainText('memory');
+  await page.getByLabel('Filter traces').fill('does-not-match-any-trace');
+  await expect(page.getByText('No matching traces')).toBeVisible();
+  expect(errors).toEqual([]);
+});
+
+test('campaign creation streams progress and retains completed traces', async ({ page, request }) => {
+  await page.goto('/');
+  await page.getByRole('button', { name: 'New campaign' }).click();
+  await page.getByLabel('Campaign name').fill('Browser workflow verification');
+  await page.getByLabel('Attack budget').fill('10');
+  await page.getByRole('button', { name: 'Launch campaign' }).click();
+  const row = page.getByRole('row').filter({ hasText: 'Browser workflow verification' });
+  await expect(row).toBeVisible();
+  await expect(row).toContainText('Completed', { timeout: 20_000 });
+  await expect(row).toContainText('10 / 10');
+  await row.getByRole('button', { name: /^Browser workflow verification/ }).click();
+  await expect(page.getByText('Showing 10 of 10 traces')).toBeVisible();
+  const store = await (await request.get('/api/state')).json() as Store;
+  const campaign = store.campaigns.find(c => c.name === 'Browser workflow verification')!;
+  expect(campaign.successes).toBeGreaterThan(0);
+  expect(campaign.completed).toBe(10);
+  expect(campaign.errors).toBe(0);
+});
+
+test('defense validation retains legitimate utility and detects lockdown regressions', async ({ page, request }) => {
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Open defense lab' }).click();
+  await page.getByRole('button', { name: 'Run validation' }).click();
+  await expect(page.getByRole('heading', { name: 'Validation results' })).toBeVisible();
+  await expect(page.locator('.validation-metrics>div').nth(0)).toContainText('100%');
+  await expect(page.locator('.validation-metrics>div').nth(1)).toContainText('100%');
+  await expect(page.locator('.validation-verdict')).toHaveText('Protected');
+  await page.getByLabel('Strict lockdown').check();
+  await page.getByRole('button', { name: 'Run validation' }).click();
+  await expect(page.locator('.validation-metrics>div').nth(1)).toContainText('0 of 5 tasks passed');
+  await expect(page.locator('.validation-verdict')).toHaveText('Needs review');
+  await page.getByLabel('Strict lockdown').uncheck();
+  await page.getByRole('button', { name: 'Apply to future campaigns' }).click();
+  await expect(page.getByRole('status')).toContainText('Defenses applied');
+  const state = await (await request.get('/api/state')).json() as Store;
+  expect(state.targets.find(t => t.id === 'atlas')!.defenses.toolPermissions).toBe(true);
+  expect(state.validations.at(-1)!.utilityPassed).toBe(0);
+  await page.getByRole('button', { name: 'Regression tests', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Validation history' })).toBeVisible();
+  await expect(page.locator('tbody tr')).toHaveCount(2);
+});
+
+test('mobile dashboard, navigation, and campaign dialog stay within the viewport', async ({ page }, testInfo) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/');
+  await expect(page.getByRole('heading', { name: 'Security overview' })).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await page.screenshot({ path: testInfo.outputPath('mobile.png'), fullPage: true });
+  await page.getByRole('button', { name: 'Open menu' }).click();
+  await page.getByRole('button', { name: /^Target agents/ }).click();
+  await expect(page.getByRole('heading', { name: 'Target agents' })).toBeVisible();
+  await page.getByRole('button', { name: 'Test this agent' }).first().click();
+  await expect(page.getByRole('dialog')).toBeVisible();
+  const bounds = await page.getByRole('dialog').boundingBox();
+  expect(bounds!.x).toBeGreaterThanOrEqual(0);
+  expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(390);
+  await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+});
+
+test('API validates inputs, denies cross-origin mutation, and stops campaigns', async ({ request }) => {
+  expect((await request.post('/api/campaigns', { data: { name: '', targetId: 'missing', surfaces: [], budget: 1000 } })).status()).toBe(400);
+  expect((await request.post('/api/traces/import', { data: { schemaVersion: 1, trace: {} } })).status()).toBe(400);
+  expect((await request.post('/api/campaigns', { headers: { Origin: 'https://unrelated.invalid' }, data: {} })).status()).toBe(403);
+  const response = await request.post('/api/campaigns', { data: { name: 'Stop verification', targetId: 'atlas', surfaces: ['tools'], budget: 100, seed: 20 } });
+  expect(response.status()).toBe(201);
+  const campaign = await response.json();
+  const stopped = await request.post(`/api/campaigns/${campaign.id}/stop`);
+  expect((await stopped.json()).status).toBe('stopped');
+  const state = await (await request.get('/api/state')).json() as Store;
+  expect(state.campaigns.find(c => c.id === campaign.id)!.completed).toBeLessThan(100);
+});
