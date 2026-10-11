@@ -1,0 +1,21 @@
+.veo-intro{position:fixed;inset:83px 0 0;z-index:45;background:#030403;color:#f4f4f1;opacity:1;transition:opacity .6s ease;overflow:hidden}
+.veo-intro.veo-leaving{opacity:0;pointer-events:none}
+.veo-film{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#030403;pointer-events:none}
+.veo-shade{position:absolute;inset:0;background:linear-gradient(90deg,#03040335,transparent 60%),linear-gradient(0deg,#030403cc,transparent 48%);pointer-events:none}
+.veo-caption{position:absolute;left:max(50px,calc((100vw - 1300px)/2));bottom:19%;max-width:650px;animation:veo-caption-in .5s ease both}
+.veo-caption>span{font:10px/1.6 Consolas,monospace;letter-spacing:2.5px;color:#c8f653}
+.veo-caption h2{margin:16px 0 0;font-family:'DM Sans',Arial,sans-serif;font-size:clamp(30px,3.7vw,56px);font-weight:600;letter-spacing:-1.9px;line-height:1.16}
+.veo-caption h2 em{font-style:normal}
+.veo-warning h2 em,.veo-warning>span{color:#ecc443}
+.veo-lime h2 em{color:#c8ff36}
+.veo-disclaimer{position:absolute;bottom:31px;left:max(50px,calc((100vw - 1300px)/2));font:10px/1.5 Consolas,monospace;color:#9ba192;max-width:calc(100% - 210px)}
+.veo-skip{position:absolute;right:40px;bottom:22px;color:#d6f49b;background:#0d110d;border:1px solid #485a31;padding:12px 18px;font-size:11px;display:flex;gap:18px;align-items:center}
+.veo-skip:focus-visible{outline:2px solid #c8ff36;outline-offset:4px}
+.veo-progress{position:absolute;bottom:0;left:0;right:0;height:1px;background:#23281b}
+.veo-progress>span{display:block;height:1px;background:#b9e35b;transition:width .2s linear}
+.approved-landing.al-introducing .al-main,.approved-landing.al-introducing .al-footer{visibility:hidden}
+.approved-landing:not(.al-introducing) .al-hero{animation:veo-hero-in .7s ease both}
+@keyframes veo-caption-in{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+@keyframes veo-hero-in{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+@media(max-width:800px){.veo-intro{top:100px}.veo-caption{left:24px;right:24px;bottom:24%;max-width:none}.veo-caption h2{font-size:35px;letter-spacing:-1.2px}.veo-caption>span{font-size:9px}.veo-disclaimer{left:24px;bottom:85px;max-width:calc(100% - 48px);font-size:9px}.veo-skip{right:24px;bottom:22px}.veo-film{object-position:50% 35%}}
+@media(prefers-reduced-motion:reduce){.veo-intro{display:none}.approved-landing .al-hero,.veo-caption{animation:none!important}.veo-progress>span{transition:none}}
