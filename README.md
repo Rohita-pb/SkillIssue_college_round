@@ -43,7 +43,7 @@ The browser suite starts a separate server on port 3101 with a fresh temporary d
 - **Reproducibility:** Full target snapshots and exact payloads, one-click replay, portable JSON exports/imports, and configuration fingerprints. Built-in simulation replay is deterministic. External models may vary.
 - **Defense lab:** Source quarantine, least-privilege tool enforcement, protected memory, outbound allowlists, and a deliberately restrictive lockdown option. Validation does not change target settings; Apply changes future campaigns.
 - **Regression history:** Replays successful original attacks and runs legitimate sandbox tool-contract checks. Utility checks cover public retrieval, in-scope account access, a $25 refund, preference memory, and an approved internal request where those tools are registered.
-- **Local persistence:** Atomic JSON snapshots in `.agentbreak/store.json`. Running campaigns become stopped after a server restart. Set `AGENTBREAK_DATA_DIR` to use another data directory.
+- **Local persistence:** Atomic JSON snapshots in `.agentbreak/store.json` are retained as a development fallback. Production uses PostgreSQL transactions and tenant-specific locks; running campaigns are resumed by BullMQ workers after a restart.
 
 ### Platform features
 
@@ -56,6 +56,30 @@ The browser suite starts a separate server on port 3101 with a fresh temporary d
 - **Release Gate:** Run permanent attack cases and legitimate utility checks against an exact twin fingerprint. Enforce thresholds for critical exploits, exploit rate, utility, corpus size, and p95 latency. CI can call the same endpoint with an operator token.
 - **Evidence Vault:** Hash-linked append-only audit entries connect experiments, runtime decisions, effects, verifier findings, repairs, and release gates. Chain verification makes tampering visible. Exports are suitable for external signing and incident replay.
 - **Universal gateway foundation:** The runtime API uses a normalized operation contract, so adapters for MCP, OpenAI-compatible function calling, LangGraph, or other frameworks can map into the same isolated tool gateway. No unimplemented connector is described as supported.
+
+### Production deployment
+
+The production path uses PostgreSQL for durable tenant-scoped state, Redis/BullMQ for campaign execution, a separate worker process, explicit JWT authentication, Helmet, rate limits, SSE progress, and signed audit heads. The JSON store is only a local development fallback when `DATABASE_URL` is absent.
+
+```sh
+cp .env.example .env
+# Set a strong POSTGRES_PASSWORD, JWT secret or public key, CORS origin, and
+# audit signing secret (or AWS KMS settings). Keep DATABASE_URL in sync with
+# POSTGRES_USER, POSTGRES_PASSWORD, and POSTGRES_DB.
+docker compose -f docker-compose.production.yml config
+docker compose -f docker-compose.production.yml up -d --build
+docker compose -f docker-compose.production.yml ps
+```
+
+The API is exposed on `PORT` (default `3001`). Deploy `api` and `worker` as separate services or replica groups. Readiness is `/api/health/ready`; liveness is `/api/health/live`. The API readiness probe reports the database connection and at least one live worker heartbeat.
+
+Production configuration requires `DATABASE_URL`, `REDIS_URL`, an RS256 `AGENTBREAK_JWT_PUBLIC_KEY` or a 32+ character `AGENTBREAK_JWT_SECRET`, exact HTTP(S) origins in `AGENTBREAK_CORS_ORIGINS`, and AWS KMS signing or a 32+ character `AGENTBREAK_AUDIT_SIGNING_SECRET`. JWTs must contain `sub`, `tenantId`, `exp`, issuer, and audience claims. The Compose file passes the same explicit database and Redis URLs to the migration, API, and worker services; it does not derive a URL from an unescaped password.
+
+The migration job runs before the API and worker. For a manually controlled rollout, run `docker compose -f docker-compose.production.yml run --rm migrate` before starting the long-running services. Keep the Postgres volume and its original password together across restarts; changing `POSTGRES_PASSWORD` after initialization does not rotate an existing database credential. With HS256, an operator token can be issued after the image is built with `docker compose -f docker-compose.production.yml exec api npm run auth:token -- operator <tenantId> operator`. With RS256, issue tokens through the configured identity provider instead.
+
+Campaign rows are durably dispatched from PostgreSQL, and the worker reconciles running rows after Redis/API restarts. Campaign progress is available from `GET /api/campaigns/:id/events`.
+
+Connector operations are accepted through `/api/gateway/:provider/sessions/:id/operations` and `/stream` for `mcp`, `anthropic`, `langgraph`, and `openai`. They are normalized into the same Runtime Shield contract and protected by per-provider circuit breakers.
 
 ## Sandbox versus real models
 
@@ -86,10 +110,13 @@ All paths are under `/api`. Errors return `{ "error": "message" }`.
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/health` | API status and model connection availability |
+| GET | `/health` | API, database, queue, and model status |
+| GET | `/health/live` | Liveness probe |
+| GET | `/health/ready` | Database and queue readiness probe |
 | GET | `/state` | Targets, campaigns, traces, and validations |
 | POST | `/campaigns` | Start an adaptive run |
 | POST | `/campaigns/:id/stop` | Stop a run and preserve completed attempts |
+| GET | `/campaigns/:id/events` | Server-sent campaign progress stream |
 | POST | `/traces/:id/replay` | Replay the original target snapshot and payload |
 | GET | `/traces/:id/export` | Download a portable trace |
 | POST | `/traces/import` | Execute a version 1 exported trace in this instance |
@@ -112,6 +139,8 @@ All paths are under `/api`. Errors return `{ "error": "message" }`.
 | POST | `/platform/gates` | Run a CI-style release gate |
 | GET | `/platform/report` | Download the platform evidence package |
 | GET | `/platform/audit/verify` | Verify the tamper-evident hash chain |
+| POST | `/gateway/:provider/sessions/:id/operations` | Normalize and execute a provider tool operation |
+| POST | `/gateway/:provider/sessions/:id/stream` | Stream normalized provider decisions over SSE |
 
 Example campaign body:
 
@@ -150,10 +179,10 @@ shared/types.ts      Shared API domain types
 shared/platform.ts   Digital twins, operations, effects, evidence, gates, and scores
 server/engine.ts     Adaptive selection, isolated tools, simulation/model runners
 server/platform/     Twin schemas, runtime gateway, effect oracle, swarm, repair search, gates, audit chain
-server/store.ts      Seed campaigns and atomic JSON persistence
+server/store.ts      Tenant-scoped PostgreSQL transactions with atomic JSON fallback
 server/index.ts      Express API and production static server
 server/engine.test.ts Security invariants and functional regressions
 server/platform.test.ts Platform runtime, causal, repair, gate, and audit invariants
 ```
 
-The application is a local development workbench with a single workspace. Operator authentication is optional and enabled with `AGENTBREAK_OPERATOR_TOKEN`; gateway authentication is surfaced for integration work with `AGENTBREAK_GATEWAY_TOKEN`. Multi-tenant isolation inside the digital twin is enforced and tested, but production deployment still needs a real identity provider, durable database, distributed scheduling, provider-specific connectors, and external signing.
+The application supports local simulation and production deployment. Production uses JWT identity claims, PostgreSQL, Redis/BullMQ, provider-specific normalization, and KMS/HMAC audit-head signatures. The digital twin remains synthetic; connector calls never bypass Runtime Shield or contact target systems directly.

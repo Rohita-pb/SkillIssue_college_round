@@ -1,201 +1,226 @@
 import express from 'express';
+import helmet from 'helmet';
+import cors from 'cors';
+import rateLimit from 'express-rate-limit';
+import { RedisStore } from 'rate-limit-redis';
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { SURFACES, type AttackInput, type Campaign, type Defense, type Surface, type Target, type ToolName } from '../shared/types.js';
-import { id, runAttack, selectAttack, validateDefenses } from './engine.js';
-import { loadStore, saveStore } from './store.js';
+import { z } from 'zod';
+import { SURFACES, type Campaign, type Defense, type Store } from '../shared/types.js';
+import { TWIN_TOOLS, type PlatformState } from '../shared/platform.js';
+import { id, runAttack, validateDefenses } from './engine.js';
+import { withStore, loadStore, checkDatabase, closeDatabase, usesDatabase } from './store.js';
 import { advanceExperiment, analyzeRun, applyRepair, approveRuntime, createSession, findRepair, getTwin, importTwin, patchTwin, replayRun, runGate, runRuntimeOperation, startExperiment, stopExperiment, viewPlatform } from './platform/index.js';
-import { auditPermissions } from './platform/twins.js';
+import { auditPermissions, policySchema } from './platform/twins.js';
 import { appendAudit, verifyAudit } from './platform/audit.js';
-import { type Operation, type PlatformState, type ShieldPolicy } from '../shared/platform.js';
+import { verifyAuditSignature } from './audit-signing.js';
+import { authMiddleware, isPrivileged, tenantId, validateProductionConfig, verifyToken } from './auth.js';
+import { executeCampaign } from './campaigns.js';
+import { enqueueCampaign, queueEnabled, checkQueue, redisClient, closeQueueConnections } from './queue.js';
+import { normalizeProviderOperation, providerNames } from './connectors/index.js';
 
+validateProductionConfig();
 const app = express();
-const store = loadStore();
-const running = new Set<string>();
-const validations = new Set<string>();
 app.disable('x-powered-by');
-app.use(express.json({ limit: '128kb' }));
-// Local-only API; same-origin browser clients and CLI clients are supported.
+app.set('trust proxy', Number(process.env.AGENTBREAK_TRUST_PROXY_HOPS || 0));
+app.use(helmet({ contentSecurityPolicy: { directives: { 'script-src': ["'self'"], 'upgrade-insecure-requests': process.env.NODE_ENV === 'production' ? [] : null } } }));
+const asyncRoute = (fn: (req: express.Request, res: express.Response) => unknown) => (req: express.Request, res: express.Response, next: express.NextFunction) => { Promise.resolve().then(() => fn(req, res)).catch(next); };
+let shuttingDown = false;
+app.get('/api/health/live', (_req, res) => res.json({ status: 'ok' }));
+app.get(['/api/health', '/api/health/ready'], asyncRoute(async (_req, res) => {
+  const [database, queue] = await Promise.all([checkDatabase(), checkQueue()]);
+  const ready = !shuttingDown && database && queue.connected && queue.worker;
+  res.status(ready ? 200 : 503).json({ status: ready ? 'ok' : 'not-ready', database, queue, modelConnected: Boolean(process.env.AGENTBREAK_MODEL_NAME) });
+}));
+const origins = new Set((process.env.AGENTBREAK_CORS_ORIGINS || '').split(',').map(value => value.trim()).filter(Boolean));
 app.use('/api', (req, res, next) => {
   const origin = req.headers.origin;
   if (origin) {
-    try {
-      const originUrl = new URL(origin);
-      const requestHostname = String(req.headers.host || '').split(':')[0].replace('[', '').replace(']', '');
-      const loopback = new Set(['localhost', '127.0.0.1', '::1']);
-      const sameOrigin = originUrl.host === req.headers.host;
-      // Vite’s local dev proxy keeps the browser on :5173 while forwarding
-      // requests to the API on :3001. Both endpoints remain loopback-only.
-      const localDevProxy = loopback.has(originUrl.hostname) && loopback.has(requestHostname);
-      if (!sameOrigin && !localDevProxy) return res.status(403).json({ error: 'Cross-origin API access is disabled.' });
+    let allowed = origins.has(origin);
+    if (process.env.NODE_ENV !== 'production') {
+      try {
+        const url = new URL(origin);
+        const host = new URL(`http://${req.headers.host}`).hostname;
+        const loopback = ['localhost', '127.0.0.1', '[::1]'];
+        allowed ||= url.host === req.headers.host || (loopback.includes(url.hostname) && loopback.includes(host));
+      } catch { /* malformed origins fail closed */ }
     }
-    catch { return res.status(403).json({ error: 'Invalid origin.' }); }
+    if (!allowed) return res.status(403).json({ error: 'Origin is not allowed.' });
+  } else if (req.headers.cookie?.includes('agentbreak_session=') && !['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
+    return res.status(403).json({ error: 'Cookie-authenticated mutations require an allowed Origin.' });
   }
   next();
 });
+app.use('/api', cors({ origin: true, credentials: true, allowedHeaders: ['Authorization', 'Content-Type', 'Last-Event-ID'], maxAge: 600 }));
+app.use('/api', rateLimit({ windowMs: 60_000, limit: Number(process.env.AGENTBREAK_RATE_LIMIT || 300), standardHeaders: 'draft-7', legacyHeaders: false,
+  ...(queueEnabled() ? { store: new RedisStore({ sendCommand: (...args: string[]) => redisClient().call(...args as [string, ...string[]]) as Promise<number | string | (number | string)[]>, prefix: 'agentbreak:ratelimit:' }) } : {}),
+}));
+app.use(express.json({ limit: '128kb' }));
+app.post('/api/auth/session', asyncRoute((req, res) => {
+  const token = z.string().min(1).max(16000).parse(req.body?.token);
+  const user = verifyToken(token);
+  res.cookie('agentbreak_session', token, { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'strict', path: '/api', maxAge: Math.max(0, user.expiresAt! - Date.now()) });
+  res.json({ subject: user.subject, tenantId: user.tenantId, roles: user.roles });
+}));
+app.use('/api', authMiddleware);
+app.get('/api/auth/me', (req, res) => res.json(req.user));
+app.post('/api/auth/logout', (_req, res) => { res.clearCookie('agentbreak_session', { path: '/api', httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'strict' }); res.sendStatus(204); });
+app.use('/api', (req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store');
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method) && !isPrivileged(req) && !req.user?.roles.includes('analyst') && !(req.path.startsWith('/gateway/') && req.user?.roles.includes('gateway'))) return res.status(403).json({ error: 'Write access requires the analyst, operator, or gateway role.' });
+  next();
+});
 
-app.get('/api/state', (_req, res) => res.json(store));
-app.get('/api/health', (_req, res) => res.json({ status: 'ok', mode: 'sandbox', modelConnected: store.targets.some(t => t.mode === 'model') }));
-app.get('/api/platform', (_req, res) => res.json(store.platform ? viewPlatform(store.platform) : null));
-app.get('/api/platform/twins/:id/audit', (req, res) => { try { const twin = getTwin(requirePlatform(), req.params.id); res.json({ twin, findings: auditPermissions(twin) }); } catch (error) { res.status(404).json({ error: error instanceof Error ? error.message : 'Twin not found.' }); } });
-app.get('/api/platform/audit/verify', (_req, res) => res.json(store.platform ? verifyAudit(store.platform.audit) : { valid: false, checked: 0, head: 'GENESIS' }));
-app.get('/api/platform/report', (_req, res) => { if (!store.platform) return res.status(503).json({ error: 'Platform state is not initialized.' }); res.setHeader('Content-Disposition', 'attachment; filename="agentbreak-platform-evidence.json"'); res.json({ schemaVersion: 2, generatedAt: new Date().toISOString(), evidenceBoundary: 'Synthetic digital twin; in-memory effects; hash-linked audit chain.', platform: viewPlatform(store.platform) }); });
+class HttpError extends Error { constructor(public status: number, message: string) { super(message); } }
+function found<T>(value: T | undefined, label: string): T { if (!value) throw new HttpError(404, `${label} not found.`); return value; }
+function operator(req: express.Request) { if (!isPrivileged(req)) throw new HttpError(403, 'Operator role required.'); }
+function platform(store: Store): PlatformState { return found(store.platform, 'Platform'); }
+const read = (path: string, action: (store: Store, req: express.Request) => unknown) => app.get(path, asyncRoute(async (req, res) => res.json(await withStore(tenantId(req), store => action(store, req), false))));
+const mutate = (path: string, action: (store: Store, req: express.Request) => unknown, status = 201) => app.post(path, asyncRoute(async (req, res) => {
+  const result = await withStore(tenantId(req), async store => {
+    const result = await action(store, req);
+    if (store.platform) appendAudit(store.platform.audit, 'api.mutation', req.path, { actor: req.user!.subject, tenantId: tenantId(req), method: req.method });
+    return result;
+  });
+  res.status(status).json(result);
+}));
+const defenseSchema = z.object({ sourceIsolation: z.boolean(), toolPermissions: z.boolean(), memoryGuard: z.boolean(), outboundFilter: z.boolean(), lockdown: z.boolean() }).strict();
+const operationSchema = z.object({ id: z.string().min(1).max(160), label: z.string().min(1).max(200), tool: z.enum(TWIN_TOOLS), args: z.record(z.string(), z.unknown()), turn: z.number().int().min(0).max(100), source: z.object({ kind: z.enum(['user', 'retrieval', 'memory', 'delegation']), id: z.string().min(1).max(200), trusted: z.boolean() }).strict(), requires: z.array(z.string()).max(100).optional() }).strict();
 
-function requirePlatform(): PlatformState { if (!store.platform) throw new Error('Platform state is not initialized.'); return store.platform; }
-function persistPlatform() { saveStore(store); }
-function requireOperator(req: express.Request, res: express.Response): boolean {
-  const expected = process.env.AGENTBREAK_OPERATOR_TOKEN;
-  if (!expected) return true;
-  if (req.headers.authorization !== `Bearer ${expected}`) { res.status(401).json({ error: 'Operator authentication required for this control-plane action.' }); return false; }
-  return true;
-}
-function parseOperation(input: unknown): Operation {
-  if (!input || typeof input !== 'object') throw new Error('A runtime operation object is required.');
-  const value = input as Partial<Operation>;
-  if (typeof value.id !== 'string' || typeof value.label !== 'string' || typeof value.tool !== 'string' || !Number.isInteger(value.turn) || !value.source || typeof value.source !== 'object' || !value.args || typeof value.args !== 'object' || Array.isArray(value.args)) throw new Error('Invalid runtime operation.');
-  return value as Operation;
-}
-function withPlatformErrors(handler: (req: express.Request, res: express.Response) => unknown) { return (req: express.Request, res: express.Response, next: express.NextFunction) => { try { const result = handler(req, res); if (result instanceof Promise) void result.catch(next); } catch (error) { const message = error instanceof Error ? error.message : 'Platform operation failed.'; res.status(message.includes('not found') ? 404 : 400).json({ error: message }); } }; }
-
-async function executeCampaign(campaign: Campaign) {
-  running.add(campaign.id);
-  try {
-    while (campaign.status === 'running' && campaign.completed < campaign.budget) {
-      const history = store.traces.filter(t => t.campaignId === campaign.id && !t.replayOf);
-      const trace = await runAttack(campaign.targetSnapshot, selectAttack(campaign, history), campaign.id);
-      if (campaign.status !== 'running') break;
-      store.traces.push(trace);
-      campaign.completed++;
-      if (trace.outcome === 'success') campaign.successes++;
-      if (trace.outcome === 'error') campaign.errors++;
-      saveStore(store);
-      await new Promise(resolve => setTimeout(resolve, 350));
-    }
-    if (campaign.status === 'running') campaign.status = campaign.errors === campaign.completed ? 'failed' : 'completed';
-  } catch (error) {
-    campaign.status = 'failed';
-    console.error('Campaign failed:', error);
-  } finally {
-    campaign.finishedAt = new Date().toISOString();
-    saveStore(store);
-    running.delete(campaign.id);
-  }
-}
-
-app.post('/api/campaigns', (req, res) => {
-  const { name, targetId, surfaces, budget, seed } = req.body;
-  const target = store.targets.find(t => t.id === targetId);
-  if (!target || typeof name !== 'string' || !name.trim() || name.length > 100 || !Array.isArray(surfaces) || !surfaces.length || !surfaces.every(s => SURFACES.some(a => a.id === s)) || !Number.isInteger(budget) || budget < 5 || budget > 100 || !Number.isInteger(seed) || seed < 0 || seed > 2147483647) return res.status(400).json({ error: 'Provide a target, campaign name, valid attack surfaces, 5–100 attempts, and a nonnegative integer seed.' });
-  if (running.size >= 3) return res.status(409).json({ error: 'Three campaigns are already running. Wait for one to finish.' });
-  const campaign: Campaign = { id: id('cmp'), name: name.trim(), targetId, surfaces: [...new Set(surfaces)] as Surface[], budget, seed, status: 'running', completed: 0, successes: 0, errors: 0, startedAt: new Date().toISOString(), targetSnapshot: structuredClone(target) };
-  store.campaigns.push(campaign);
-  saveStore(store);
+read('/api/state', store => store);
+read('/api/report', store => ({ generatedAt: new Date().toISOString(), environment: 'Synthetic sandbox effects', ...store }));
+app.post('/api/campaigns', asyncRoute(async (req, res) => {
+  const input = z.object({ name: z.string().trim().min(1).max(100), targetId: z.string(), surfaces: z.array(z.enum(['retrieval', 'instructions', 'memory', 'tools', 'multi-stage'])).min(1).max(5), budget: z.number().int().min(5).max(100), seed: z.number().int().min(0).max(2147483647) }).strict().parse(req.body);
+  const tenant = tenantId(req);
+  const campaign = await withStore(tenant, store => {
+    const target = found(store.targets.find(target => target.id === input.targetId), 'Target');
+    if (store.campaigns.filter(item => item.status === 'running').length >= 3) throw new HttpError(409, 'Three campaigns are already running.');
+    const campaign: Campaign = { ...input, id: id('cmp'), tenantId: tenant, surfaces: [...new Set(input.surfaces)], status: 'running', completed: 0, successes: 0, errors: 0, startedAt: new Date().toISOString(), targetSnapshot: structuredClone(target) };
+    store.campaigns.push(campaign); return campaign;
+  });
+  if (queueEnabled()) {
+    // The worker's database reconciler retries dispatch if Redis is unavailable.
+    void enqueueCampaign(campaign).catch(error => console.error('Dispatch deferred to reconciler:', error.message));
+  } else void executeCampaign(tenant, campaign.id).catch(error => console.error('Inline campaign failed:', error));
   res.status(201).json(campaign);
-  void executeCampaign(campaign);
-});
-
-app.post('/api/campaigns/:id/stop', (req, res) => {
-  const campaign = store.campaigns.find(c => c.id === req.params.id);
-  if (!campaign) return res.status(404).json({ error: 'Campaign not found.' });
-  if (campaign.status === 'running') { campaign.status = 'stopped'; campaign.finishedAt = new Date().toISOString(); saveStore(store); }
-  res.json(campaign);
-});
-
-app.get('/api/traces/:id/export', (req, res) => {
-  const trace = store.traces.find(t => t.id === req.params.id);
-  if (!trace) return res.status(404).json({ error: 'Trace not found.' });
-  res.setHeader('Content-Disposition', `attachment; filename="agentbreak-${trace.id}.json"`);
-  res.json({ schemaVersion: 1, exportedAt: new Date().toISOString(), reproduction: { method: 'POST', path: `/api/traces/${trace.id}/replay`, note: 'Replays the exact payload and target snapshot. Simulation is deterministic; external model behavior can vary. Import this file with POST /api/traces/import to replay on another instance.' }, trace });
-});
-
-app.post('/api/traces/:id/replay', async (req, res, next) => {
-  try {
-    const original = store.traces.find(t => t.id === req.params.id);
-    if (!original) return res.status(404).json({ error: 'Trace not found.' });
-    if (original.targetSnapshot.mode === 'model' && !store.targets.some(t => t.id === 'live-model')) return res.status(409).json({ error: 'Configure the original model endpoint before replaying this trace.' });
-    const trace = await runAttack(original.targetSnapshot, original.input, original.campaignId, original.id);
-    store.traces.push(trace);
-    saveStore(store);
-    res.json(trace);
-  } catch (error) { next(error); }
-});
-
-app.post('/api/traces/import', async (req, res, next) => {
-  const original = req.body?.trace;
-  const input = original?.input as AttackInput | undefined;
-  const snapshot = original?.targetSnapshot as Target | undefined;
-  const tools: ToolName[] = ['read_document', 'read_private_record', 'http_request', 'issue_refund', 'write_memory'];
-  if (req.body?.schemaVersion !== 1 || !input || !snapshot || typeof original.id !== 'string' ||
-      !SURFACES.some(s => s.id === input.surface) || !Number.isInteger(input.variant) || input.variant < 0 || input.variant > 3 ||
-      typeof input.payload !== 'string' || input.payload.length > 16000 || typeof input.strategy !== 'string' || typeof input.objective !== 'string' ||
-      typeof snapshot.id !== 'string' || typeof snapshot.name !== 'string' || !['simulation', 'model'].includes(snapshot.mode) ||
-      !Array.isArray(snapshot.tools) || !snapshot.tools.every(t => tools.includes(t)) ||
-      !Array.isArray(snapshot.weaknesses) || !snapshot.weaknesses.every(s => SURFACES.some(a => a.id === s)) || !validDefense(snapshot.defenses)) {
-    return res.status(400).json({ error: 'Upload a version 1 AgentBreak trace export with a valid attack input and target snapshot.' });
+}));
+mutate('/api/campaigns/:id/stop', (store, req) => {
+  const campaign = found(store.campaigns.find(item => item.id === req.params.id), 'Campaign');
+  if (campaign.status === 'running') { campaign.status = 'stopped'; campaign.finishedAt = new Date().toISOString(); }
+  return campaign;
+}, 200);
+app.get('/api/campaigns/:id/events', asyncRoute(async (req, res) => {
+  const tenant = tenantId(req);
+  const initial = await loadStore(tenant);
+  found(initial.campaigns.find(item => item.id === req.params.id), 'Campaign');
+  res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache, no-transform', 'X-Accel-Buffering': 'no' });
+  res.flushHeaders();
+  let closed = false;
+  req.on('close', () => { closed = true; });
+  let last = '';
+  while (!closed) {
+    if (req.user?.expiresAt && Date.now() >= req.user.expiresAt) break;
+    const state = await loadStore(tenant);
+    const campaign = found(state.campaigns.find(item => item.id === req.params.id), 'Campaign');
+    const revision = `${campaign.completed}:${campaign.status}`;
+    if (revision !== last) {
+      const data = { campaign, traces: state.traces.filter(trace => trace.campaignId === campaign.id) };
+      res.write(`id: ${revision}\nevent: ${campaign.status === 'running' ? 'progress' : 'complete'}\ndata: ${JSON.stringify(data)}\n\n`);
+      last = revision;
+    } else res.write(': heartbeat\n\n');
+    if (campaign.status !== 'running' || res.writableLength > 1024 * 1024) break;
+    await new Promise(resolve => setTimeout(resolve, 1000));
   }
-  if (snapshot.mode === 'model' && !store.targets.some(t => t.mode === 'model' && t.model === snapshot.model)) return res.status(409).json({ error: 'Connect the matching model before importing this model-backed trace.' });
-  try {
-    const trace = await runAttack(snapshot, input, 'imported', original.id);
-    store.traces.push(trace);
-    saveStore(store);
-    res.status(201).json(trace);
-  } catch (error) { next(error); }
+  res.end();
+}));
+read('/api/traces/:id/export', (store, req) => ({ schemaVersion: 1, exportedAt: new Date().toISOString(), trace: found(store.traces.find(trace => trace.id === req.params.id), 'Trace') }));
+mutate('/api/traces/:id/replay', async (store, req) => {
+  const original = found(store.traces.find(trace => trace.id === req.params.id), 'Trace');
+  const trace = await runAttack(original.targetSnapshot, original.input, original.campaignId, original.id);
+  trace.tenantId = tenantId(req); store.traces.push(trace); return trace;
+}, 200);
+mutate('/api/traces/import', async (store, req) => {
+  const input = z.object({ surface: z.enum(['retrieval', 'instructions', 'memory', 'tools', 'multi-stage']), variant: z.number().int().min(0).max(3), payload: z.string().max(16000), strategy: z.string().max(1000), objective: z.string().max(2000) });
+  const target = z.object({ id: z.string().min(1).max(160), name: z.string().max(100), description: z.string().max(2000), initials: z.string().max(10), color: z.string().max(30), mode: z.enum(['simulation', 'model']), model: z.string().optional(), tenantId: z.string().optional(), tools: z.array(z.enum(['read_document', 'read_private_record', 'http_request', 'issue_refund', 'write_memory'])).max(5), weaknesses: z.array(input.shape.surface).max(5), defenses: defenseSchema });
+  const value = z.object({ schemaVersion: z.literal(1), trace: z.object({ id: z.string().max(160), input, targetSnapshot: target }) }).parse(req.body);
+  const snapshot = value.trace.targetSnapshot;
+  if (snapshot.mode === 'model' && snapshot.model !== process.env.AGENTBREAK_MODEL_NAME) throw new HttpError(409, 'Connect the matching model first.');
+  const targetId = store.targets.some(item => item.id === snapshot.id) ? snapshot.id : id('imported-target');
+  if (!store.targets.some(item => item.id === targetId)) store.targets.push({ ...snapshot, id: targetId, tenantId: tenantId(req) });
+  const campaign: Campaign = { id: id('import'), tenantId: tenantId(req), name: 'Imported reproduction', targetId, surfaces: [value.trace.input.surface], budget: 1, seed: 0, status: 'completed', completed: 1, successes: 0, errors: 0, startedAt: new Date().toISOString(), targetSnapshot: snapshot };
+  const trace = await runAttack(snapshot, value.trace.input, campaign.id, value.trace.id);
+  trace.tenantId = tenantId(req); campaign.successes = Number(trace.outcome === 'success'); campaign.errors = Number(trace.outcome === 'error'); campaign.finishedAt = trace.createdAt;
+  store.campaigns.push(campaign); store.traces.push(trace); return trace;
+});
+mutate('/api/validations', async (store, req) => {
+  const target = found(store.targets.find(target => target.id === req.body?.targetId), 'Target');
+  const validation = await validateDefenses(target, defenseSchema.parse(req.body.defenses), store.traces);
+  validation.tenantId = tenantId(req); store.validations.push(validation); return validation;
+}, 200);
+app.patch('/api/targets/:id/defenses', asyncRoute(async (req, res) => res.json(await withStore(tenantId(req), store => {
+  const target = found(store.targets.find(target => target.id === req.params.id), 'Target');
+  target.defenses = defenseSchema.parse(req.body) as Defense; return target;
+}))));
+
+read('/api/platform', store => viewPlatform(platform(store)));
+read('/api/platform/report', store => ({ schemaVersion: 2, generatedAt: new Date().toISOString(), evidenceBoundary: 'Synthetic digital twin effects', platform: viewPlatform(platform(store)) }));
+read('/api/platform/twins/:id/audit', (store, req) => { const twin = getTwin(platform(store), req.params.id); return { twin, findings: auditPermissions(twin) }; });
+read('/api/platform/audit/verify', async (store, req) => { const state = platform(store); const chain = verifyAudit(state.audit); return { ...chain, signature: await verifyAuditSignature(state.auditSignature, chain.head, tenantId(req)) }; });
+mutate('/api/platform/twins', (store, req) => { operator(req); const twin = importTwin(platform(store), req.body); twin.tenantId = tenantId(req); return twin; });
+mutate('/api/platform/twins/:id/version', (store, req) => {
+  operator(req);
+  const patch = z.object({ policy: policySchema.optional(), shieldMode: z.enum(['observe', 'enforce']).optional(), allowedOrigins: z.array(z.string().url().refine(value => { const url = new URL(value); return url.protocol === 'https:' && value === url.origin; })).min(1).max(10).optional(), refundLimit: z.number().positive().max(10000).optional() }).strict().parse(req.body);
+  return patchTwin(platform(store), req.params.id, patch);
+});
+mutate('/api/platform/sessions', (store, req) => { const body = z.object({ twinId: z.string(), actorId: z.string().optional(), tenantId: z.string().optional() }).strict().parse(req.body); return createSession(platform(store), body.twinId, body.actorId!, body.tenantId); });
+mutate('/api/platform/sessions/:id/events', (store, req) => runRuntimeOperation(platform(store), req.params.id, operationSchema.parse(req.body)));
+mutate('/api/platform/sessions/:id/approvals/:approvalId', (store, req) => { operator(req); const body = z.object({ approve: z.boolean(), reviewer: z.string().optional(), reason: z.string().max(2000).default('') }).strict().parse(req.body); return approveRuntime(platform(store), req.params.id, req.params.approvalId, body.approve, req.user!.subject, body.reason); }, 200);
+mutate('/api/platform/experiments', (store, req) => {
+  const body = z.object({ twinId: z.string(), name: z.string().min(1).max(100).default('Autonomous attack discovery'), budget: z.number().int().min(1).max(50).default(12), seed: z.number().int().min(0).max(2147483647).default(7331), mode: z.enum(['fixture', 'model']).default('fixture') }).strict().parse(req.body);
+  if (body.mode === 'model' && !process.env.AGENTBREAK_MODEL_NAME) throw new HttpError(400, 'Model is not configured.');
+  return startExperiment(platform(store), body.twinId, body.name, body.budget, body.seed, body.mode);
+});
+mutate('/api/platform/experiments/:id/step', (store, req) => advanceExperiment(platform(store), req.params.id));
+mutate('/api/platform/experiments/:id/stop', (store, req) => stopExperiment(platform(store), req.params.id), 200);
+mutate('/api/platform/runs/:id/replay', (store, req) => replayRun(platform(store), req.params.id));
+mutate('/api/platform/runs/:id/causal', (store, req) => analyzeRun(platform(store), req.params.id));
+mutate('/api/platform/repairs/search', (store, req) => findRepair(platform(store), z.string().parse(req.body?.twinId)));
+mutate('/api/platform/repairs/:id/apply', (store, req) => { operator(req); return applyRepair(platform(store), req.params.id); });
+mutate('/api/platform/gates', (store, req) => { operator(req); return runGate(platform(store), z.string().parse(req.body?.twinId)); });
+read('/api/platform/evidence/:id', (store, req) => {
+  const state = platform(store); const run = found(state.runs.find(run => run.id === req.params.id), 'Evidence');
+  return { run, analysis: state.analyses.find(item => item.runId === run.id), audit: state.audit.filter(item => item.subjectId === run.id), graph: { nodes: run.scenario.operations.map(operation => ({ id: operation.id, label: operation.label, kind: operation.tool })), edges: run.scenario.operations.slice(1).map((operation, i) => ({ from: run.scenario.operations[i].id, to: operation.id })) } };
 });
 
-const defenseKeys: (keyof Defense)[] = ['sourceIsolation', 'toolPermissions', 'memoryGuard', 'outboundFilter', 'lockdown'];
-function validDefense(value: unknown): value is Defense { return !!value && typeof value === 'object' && defenseKeys.every(k => typeof (value as Defense)[k] === 'boolean'); }
-
-app.post('/api/validations', async (req, res, next) => {
-  const target = store.targets.find(t => t.id === req.body.targetId);
-  if (!target || !validDefense(req.body.defenses)) return res.status(400).json({ error: 'A valid target and all five defense settings are required.' });
-  if (validations.has(target.id)) return res.status(409).json({ error: 'A validation is already running for this target.' });
-  validations.add(target.id);
-  try {
-    const validation = await validateDefenses(target, req.body.defenses, [...store.traces]);
-    store.validations.push(validation);
-    saveStore(store);
-    res.json(validation);
-  } catch (error) { next(error); }
-  finally { validations.delete(target.id); }
-});
-
-app.patch('/api/targets/:id/defenses', (req, res) => {
-  const target = store.targets.find(t => t.id === req.params.id);
-  if (!target) return res.status(404).json({ error: 'Target not found.' });
-  if (!validDefense(req.body)) return res.status(400).json({ error: 'All five defense settings must be booleans.' });
-  target.defenses = Object.fromEntries(defenseKeys.map(k => [k, req.body[k]])) as unknown as Defense;
-  saveStore(store);
-  res.json(target);
-});
-
-app.get('/api/report', (_req, res) => {
-  res.setHeader('Content-Disposition', 'attachment; filename="agentbreak-security-report.json"');
-  res.json({ generatedAt: new Date().toISOString(), environment: 'Isolated sandbox; built-in targets are policy-based simulations.', ...store });
-});
-
-// AgentBreak Platform v2: twin, gateway, attack graph, repair, gate, and audit APIs.
-app.post('/api/platform/twins', withPlatformErrors((req, res) => { if (!requireOperator(req, res)) return; const twin = importTwin(requirePlatform(), req.body); persistPlatform(); res.status(201).json(twin); }));
-app.post('/api/platform/twins/:id/version', withPlatformErrors((req, res) => { if (!requireOperator(req, res)) return; const body = req.body as { policy?: ShieldPolicy; shieldMode?: 'observe' | 'enforce'; allowedOrigins?: string[]; refundLimit?: number }; const twin = patchTwin(requirePlatform(), req.params.id, body); persistPlatform(); res.status(201).json(twin); }));
-app.post('/api/platform/sessions', withPlatformErrors((req, res) => { const session = createSession(requirePlatform(), req.body.twinId, req.body.actorId, req.body.tenantId); persistPlatform(); res.status(201).json(session); }));
-app.post('/api/platform/sessions/:id/events', withPlatformErrors((req, res) => { const event = runRuntimeOperation(requirePlatform(), req.params.id, parseOperation(req.body)); persistPlatform(); res.status(201).json(event); }));
-app.post('/api/platform/sessions/:id/approvals/:approvalId', withPlatformErrors((req, res) => { if (!requireOperator(req, res)) return; const result = approveRuntime(requirePlatform(), req.params.id, req.params.approvalId, req.body.approve === true, String(req.body.reviewer || 'operator'), String(req.body.reason || '')); persistPlatform(); res.json(result); }));
-app.post('/api/platform/experiments', withPlatformErrors((req, res) => { const requestedMode = req.body.mode === 'model' ? 'model' : 'fixture'; if (requestedMode === 'model' && (!process.env.AGENTBREAK_MODEL_BASE_URL || !process.env.AGENTBREAK_MODEL_NAME)) return res.status(400).json({ error: 'Model mode requires AGENTBREAK_MODEL_BASE_URL and AGENTBREAK_MODEL_NAME. Fixture mode remains fully reproducible.' }); const experiment = startExperiment(requirePlatform(), req.body.twinId, String(req.body.name || 'Autonomous attack discovery'), Math.min(50, Math.max(1, Number(req.body.budget || 12))), Math.max(0, Number(req.body.seed || 7331)), requestedMode); persistPlatform(); res.status(201).json(experiment); }));
-app.post('/api/platform/experiments/:id/step', withPlatformErrors(async (req, res) => { const result = await advanceExperiment(requirePlatform(), req.params.id); persistPlatform(); res.status(201).json(result); }));
-app.post('/api/platform/experiments/:id/stop', withPlatformErrors((req, res) => { const experiment = stopExperiment(requirePlatform(), req.params.id); persistPlatform(); res.json(experiment); }));
-app.post('/api/platform/runs/:id/replay', withPlatformErrors(async (req, res) => { const run = await replayRun(requirePlatform(), req.params.id); persistPlatform(); res.status(201).json(run); }));
-app.post('/api/platform/runs/:id/causal', withPlatformErrors((req, res) => { const analysis = analyzeRun(requirePlatform(), req.params.id); persistPlatform(); res.status(201).json(analysis); }));
-app.post('/api/platform/repairs/search', withPlatformErrors((req, res) => { const repair = findRepair(requirePlatform(), req.body.twinId); persistPlatform(); res.status(201).json(repair); }));
-app.post('/api/platform/repairs/:id/apply', withPlatformErrors((req, res) => { if (!requireOperator(req, res)) return; const twin = applyRepair(requirePlatform(), req.params.id); persistPlatform(); res.status(201).json(twin); }));
-app.post('/api/platform/gates', withPlatformErrors(async (req, res) => { if (!requireOperator(req, res)) return; const gate = await runGate(requirePlatform(), req.body.twinId); persistPlatform(); res.status(201).json(gate); }));
-app.get('/api/platform/evidence/:id', withPlatformErrors((req, res) => { const platform = requirePlatform(); const run = platform.runs.find(r => r.id === req.params.id); const analysis = platform.analyses.find(a => a.runId === req.params.id); const audit = platform.audit.filter(a => a.subjectId === req.params.id || (a.payload && typeof a.payload === 'object' && JSON.stringify(a.payload).includes(req.params.id))); if (!run) return res.status(404).json({ error: 'Evidence subject not found.' }); res.json({ run, analysis, audit, graph: { nodes: [{ id: 'source', label: 'Untrusted source', kind: 'source' }, ...run.scenario.operations.map(o => ({ id: o.id, label: o.label, kind: o.tool })), { id: 'outcome', label: run.verification.objectiveMet ? 'Unauthorized effect' : 'Prevented', kind: 'outcome' }], edges: run.scenario.operations.map((o, i) => ({ from: i === 0 ? 'source' : run.scenario.operations[i - 1].id, to: o.id })).concat(run.scenario.operations.length ? [{ from: run.scenario.operations.at(-1)!.id, to: 'outcome' }] : []) } }); }));
-
+function gateway(req: express.Request) { if (!isPrivileged(req) && !req.user?.roles.includes('gateway')) throw new HttpError(403, 'Gateway role required.'); }
+mutate('/api/gateway/:provider/sessions/:id/operations', (store, req) => { gateway(req); return { provider: req.params.provider, event: runRuntimeOperation(platform(store), req.params.id, normalizeProviderOperation(req.params.provider, req.body)) }; });
+app.post('/api/gateway/:provider/sessions/:id/stream', asyncRoute(async (req, res) => {
+  gateway(req);
+  if (!providerNames.includes(req.params.provider as typeof providerNames[number])) throw new HttpError(404, 'Connector not found.');
+  const items = z.array(z.unknown()).min(1).max(20).parse(req.body?.events);
+  const operations = items.map(item => normalizeProviderOperation(req.params.provider, item));
+  const state = await loadStore(tenantId(req)); found(state.platform?.sessions.find(session => session.id === req.params.id), 'Session');
+  res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache, no-transform', 'X-Accel-Buffering': 'no' }); res.flushHeaders();
+  for (const operation of operations) {
+    if (res.destroyed) break;
+    const event = await withStore(tenantId(req), store => runRuntimeOperation(platform(store), req.params.id, operation));
+    res.write(`event: decision\ndata: ${JSON.stringify({ provider: req.params.provider, event })}\n\n`);
+  }
+  res.write('event: complete\ndata: {}\n\n'); res.end();
+}));
 app.use('/api', (_req, res) => res.status(404).json({ error: 'API endpoint not found.' }));
-const dist = resolve('dist');
-if (existsSync(dist)) { app.use(express.static(dist)); app.get('*', (_req, res) => res.sendFile(resolve(dist, 'index.html'))); }
-app.use((error: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-  console.error(error);
-  res.status(500).json({ error: 'The operation could not be completed. Check the server log and try again.' });
+if (existsSync(resolve('dist'))) { app.use(express.static(resolve('dist'))); app.get('*', (_req, res) => res.sendFile(resolve('dist/index.html'))); }
+app.use((error: Error & { status?: number; type?: string }, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  if (res.headersSent) { res.write('event: error\ndata: {"error":"Operation failed"}\n\n'); res.end(); return; }
+  const status = error instanceof HttpError ? error.status : error instanceof z.ZodError || error.type === 'entity.parse.failed' ? 400 : error.status === 413 ? 413 : error.message.includes('not found') ? 404 : 500;
+  if (status === 500) console.error(error);
+  res.status(status).json({ error: status === 500 ? 'The operation could not be completed.' : error instanceof z.ZodError ? 'Invalid request.' : error.message });
 });
-
 const port = Number(process.env.PORT || 3001);
-app.listen(port, '0.0.0.0', () => console.log(`AgentBreak API running at http://localhost:${port}`));
+const server = app.listen(port, '0.0.0.0', () => console.info(`AgentBreak API listening on ${port}`));
+server.requestTimeout = 240_000;
+for (const signal of ['SIGTERM', 'SIGINT']) process.once(signal, () => {
+  shuttingDown = true;
+  server.close(() => { void Promise.all([closeDatabase(), closeQueueConnections()]).then(() => process.exit(0)); });
+  setTimeout(() => process.exit(1), 30_000).unref();
+});

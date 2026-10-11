@@ -1,0 +1,12 @@
+node_modules
+dist
+dist-server
+.agentbreak
+.git
+.github
+.agents
+test-results
+playwright-report
+*.log
+.env*
+README.md

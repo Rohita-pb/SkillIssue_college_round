@@ -51,6 +51,7 @@ export interface TrustEdge {
 }
 export interface DigitalTwin {
   id: string;
+  tenantId?: string;
   name: string;
   description: string;
   version: number;
@@ -334,7 +335,17 @@ export interface PlatformState {
   repairs: RepairSearch[];
   gates: ReleaseGate[];
   audit: AuditEntry[];
+  auditSignature?: AuditSignature;
   intelligenceSharing: false;
+}
+
+export interface AuditSignature {
+  tenantId: string;
+  algorithm: 'HMAC-SHA256' | 'AWS-KMS-SHA256';
+  keyId: string;
+  signedHash: string;
+  signature: string;
+  signedAt: string;
 }
 export interface PlatformView extends PlatformState {
   scores: TrustScore[];

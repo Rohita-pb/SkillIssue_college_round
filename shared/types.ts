@@ -13,6 +13,7 @@ export interface Defense {
 
 export interface Target {
   id: string;
+  tenantId?: string;
   name: string;
   description: string;
   initials: string;
@@ -44,6 +45,7 @@ export interface AttackInput {
 
 export interface Trace {
   id: string;
+  tenantId?: string;
   campaignId: string;
   targetId: string;
   targetSnapshot: Target;
@@ -60,6 +62,7 @@ export interface Trace {
 
 export interface Campaign {
   id: string;
+  tenantId?: string;
   name: string;
   targetId: string;
   surfaces: Surface[];
@@ -76,6 +79,7 @@ export interface Campaign {
 
 export interface Validation {
   id: string;
+  tenantId?: string;
   targetId: string;
   createdAt: string;
   defenses: Defense;

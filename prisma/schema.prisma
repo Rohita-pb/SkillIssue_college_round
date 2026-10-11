@@ -1,0 +1,56 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model WorkspaceState {
+  id        String   @id
+  version   Int      @default(1)
+  state     Json
+  updatedAt DateTime @updatedAt
+}
+
+model TargetRecord {
+  tenantId  String
+  id        String
+  snapshot  Json
+  campaigns CampaignRecord[]
+  @@id([tenantId, id])
+}
+
+model CampaignRecord {
+  tenantId   String
+  id         String
+  targetId   String
+  status     String
+  completed  Int
+  startedAt  DateTime
+  snapshot   Json
+  target     TargetRecord @relation(fields: [tenantId, targetId], references: [tenantId, id])
+  traces     TraceRecord[]
+  @@id([tenantId, id])
+  @@index([status, startedAt])
+}
+
+model TraceRecord {
+  tenantId    String
+  id          String
+  campaignId  String
+  outcome     String
+  createdAt   DateTime
+  snapshot    Json
+  campaign    CampaignRecord @relation(fields: [tenantId, campaignId], references: [tenantId, id])
+  @@id([tenantId, id])
+  @@index([tenantId, campaignId, createdAt])
+}
+
+model ValidationRecord {
+  tenantId  String
+  id        String
+  createdAt DateTime
+  snapshot  Json
+  @@id([tenantId, id])
+}

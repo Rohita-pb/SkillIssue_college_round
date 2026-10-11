@@ -64,7 +64,7 @@ export function createTwin(input?: unknown): DigitalTwin {
     ],
     policy: OPEN_POLICY, shieldMode: 'enforce', allowedOrigins: ['https://helpdesk.internal'], refundLimit: 50,
   });
-  const twin: DigitalTwin = { ...manifest, id: uid('twin'), version: 1, createdAt: now(), source: input ? 'manifest' : 'fixture', fingerprint: '' };
+  const twin: DigitalTwin = { ...manifest, tenantId: 'default', id: uid('twin'), version: 1, createdAt: now(), source: input ? 'manifest' : 'fixture', fingerprint: '' };
   twin.fingerprint = fingerprintTwin(twin);
   return twin;
 }
