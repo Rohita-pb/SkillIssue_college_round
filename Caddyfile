@@ -1,0 +1,23 @@
+{
+    admin off
+}
+
+{$AGENTBREAK_DOMAIN:localhost} {
+    encode gzip zstd
+
+    # Unbuffered streaming for Server-Sent Events
+    @sse {
+        path /api/campaigns/*/events
+        path /api/gateway/*/sessions/*/stream
+    }
+    handle @sse {
+        reverse_proxy api:3001 {
+            flush_interval -1
+        }
+    }
+
+    # Standard application traffic
+    handle {
+        reverse_proxy api:3001
+    }
+}
