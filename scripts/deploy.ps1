@@ -1,5 +1,6 @@
 param(
-  [string]$Domain = "http://localhost:3001"
+  [string]$Domain = "http://localhost:3001",
+  [switch]$ResetVolume
 )
 
 $ErrorActionPreference = "Stop"
@@ -7,6 +8,12 @@ $ErrorActionPreference = "Stop"
 Write-Host "==============================================" -ForegroundColor Cyan
 Write-Host "AgentBreak Turnkey Production Deployment" -ForegroundColor Cyan
 Write-Host "==============================================" -ForegroundColor Cyan
+
+# 0. Optional volume reset
+if ($ResetVolume) {
+  Write-Host "[*] Resetting Docker volumes..." -ForegroundColor Yellow
+  docker compose -f docker-compose.production.yml down -v
+}
 
 # 1. Generate .env if not exists
 if (-not (Test-Path .env)) {
@@ -31,12 +38,12 @@ docker compose -f docker-compose.production.yml up -d --build
 
 Write-Host "[*] Waiting for services to become healthy..." -ForegroundColor Yellow
 $healthy = $false
-for ($i = 0; $i -lt 30; $i++) {
+for ($i = 0; $i -lt 35; $i++) {
   try {
     $response = Invoke-RestMethod -Uri "http://localhost:3001/api/health/ready" -TimeoutSec 3 -ErrorAction Stop
     if ($response) {
       $healthy = $true
-      Write-Host "[+] API and database are healthy!" -ForegroundColor Green
+      Write-Host "[+] API, Database, and Worker are healthy!" -ForegroundColor Green
       break
     }
   } catch {
@@ -46,7 +53,20 @@ for ($i = 0; $i -lt 30; $i++) {
 }
 
 if (-not $healthy) {
-  Write-Host "[!] Warning: Healthcheck timed out. Check logs with: docker compose -f docker-compose.production.yml logs" -ForegroundColor Yellow
+  Write-Host ""
+  Write-Host "==============================================" -ForegroundColor Red
+  Write-Host "[-] Deployment failed or timed out." -ForegroundColor Red
+  Write-Host "==============================================" -ForegroundColor Red
+  Write-Host "[*] Checking migration logs:" -ForegroundColor Yellow
+  docker compose -f docker-compose.production.yml logs --tail 20 migrate
+  Write-Host ""
+  Write-Host "[*] Checking API logs:" -ForegroundColor Yellow
+  docker compose -f docker-compose.production.yml logs --tail 20 api
+  Write-Host ""
+  Write-Host "[!] Note: If credentials changed, reset the volume by running:" -ForegroundColor Yellow
+  Write-Host "    docker compose -f docker-compose.production.yml down -v" -ForegroundColor White
+  Write-Host "    powershell -ExecutionPolicy Bypass -File scripts\deploy.ps1" -ForegroundColor White
+  exit 1
 }
 
 # 4. Issue operator token

@@ -28,18 +28,33 @@ docker compose -f docker-compose.production.yml up -d --build
 
 echo "Waiting for services to become healthy..."
 attempts=0
-max_attempts=30
+max_attempts=35
+healthy=false
 while [ $attempts -lt $max_attempts ]; do
-  if docker compose -f docker-compose.production.yml exec api node -e "fetch('http://127.0.0.1:3001/api/health/ready').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))" 2>/dev/null; then
-    echo "✓ API and database are healthy!"
+  if docker compose -f docker-compose.production.yml exec -T api node -e "fetch('http://127.0.0.1:3001/api/health/ready').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))" 2>/dev/null; then
+    echo "✓ API, Database, and Worker are healthy!"
+    healthy=true
     break
   fi
   attempts=$((attempts + 1))
   sleep 2
 done
 
-if [ $attempts -eq $max_attempts ]; then
-  echo "⚠️ Warning: Healthcheck timed out. Check logs with: docker compose -f docker-compose.production.yml logs"
+if [ "$healthy" = false ]; then
+  echo ""
+  echo "=============================================="
+  echo "❌ Deployment failed or timed out."
+  echo "=============================================="
+  echo "Checking migration logs:"
+  docker compose -f docker-compose.production.yml logs --tail 20 migrate
+  echo ""
+  echo "Checking API logs:"
+  docker compose -f docker-compose.production.yml logs --tail 20 api
+  echo ""
+  echo "If credentials changed, reset the volume by running:"
+  echo "  docker compose -f docker-compose.production.yml down -v"
+  echo "  ./scripts/deploy.sh"
+  exit 1
 fi
 
 # 4. Issue initial operator token
